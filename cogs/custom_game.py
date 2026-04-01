@@ -7,6 +7,28 @@ from utils.database import get_user, get_effective_elo, get_user_record, find_us
 from utils.riot_api import tier_value, fetch_full_profile, TIER_EMOJI, get_position_score
 
 
+async def build_participant_data(member: discord.Member) -> dict | None:
+    """등록된 유저의 참가 데이터 생성 (DB 포지션 자동 적용)"""
+    user = await get_user(member.id)
+    if not user:
+        return None
+
+    elo = await get_effective_elo(member.id)
+    record = await get_user_record(member.id)
+
+    return {
+        "name": member.display_name,
+        "riot": f"{user['riot_name']}#{user['riot_tag']}",
+        "tier": user["tier"] or "UNRANKED",
+        "rank": user["rank"] or "",
+        "positions": user["preferred_positions"] or "",
+        "lp": user["lp"] if user["lp"] else 0,
+        "elo": elo,
+        "custom_wins": record["win"],
+        "custom_losses": record["lose"],
+    }
+
+
 class PositionSelect(discord.ui.Select):
     """포지션 선택 드롭다운"""
 
@@ -100,7 +122,7 @@ class JoinButton(discord.ui.Button):
     """내전 참가 버튼"""
 
     def __init__(self):
-        super().__init__(label="참가", style=discord.ButtonStyle.green, emoji="✋")
+        super().__init__(label="참가", style=discord.ButtonStyle.green, emoji="✋", row=0)
 
     async def callback(self, interaction: discord.Interaction):
         view: LobbyView = self.view
@@ -150,7 +172,7 @@ class LeaveButton(discord.ui.Button):
     """내전 나가기 버튼"""
 
     def __init__(self):
-        super().__init__(label="나가기", style=discord.ButtonStyle.red, emoji="🚪")
+        super().__init__(label="나가기", style=discord.ButtonStyle.red, emoji="🚪", row=0)
 
     async def callback(self, interaction: discord.Interaction):
         view: LobbyView = self.view
@@ -170,7 +192,7 @@ class PartyButton(discord.ui.Button):
     """같은 팀 파티 버튼"""
 
     def __init__(self):
-        super().__init__(label="파티 묶기", style=discord.ButtonStyle.blurple, emoji="🔗")
+        super().__init__(label="파티 묶기", style=discord.ButtonStyle.blurple, emoji="🔗", row=0)
 
     async def callback(self, interaction: discord.Interaction):
         view: LobbyView = self.view
@@ -244,80 +266,202 @@ class ForceJoinButton(discord.ui.Button):
     """관리자 강제 참가 버튼"""
 
     def __init__(self):
-        super().__init__(label="강제참가", style=discord.ButtonStyle.gray, emoji="👑")
+        super().__init__(label="추가", style=discord.ButtonStyle.gray, emoji="➕", row=1)
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
             return
-        await interaction.response.send_modal(ForceJoinModal(self.view))
+        await interaction.response.send_message(
+            "👑 추가할 유저를 선택하세요 (최대 10명):",
+            view=ForceJoinSelectView(self.view),
+            ephemeral=True,
+        )
 
 
-class ForceJoinModal(discord.ui.Modal, title="강제 참가 (관리자)"):
-    member_name = discord.ui.TextInput(
-        label="디스코드 이름 또는 닉네임",
-        placeholder="예: 홍길동",
-        required=True,
-    )
+class ForceJoinUserSelect(discord.ui.UserSelect):
+    """유저 선택 드롭다운 (추가용)"""
 
-    def __init__(self, view: "LobbyView"):
-        super().__init__()
-        self.lobby_view = view
+    def __init__(self, lobby_view: "LobbyView"):
+        super().__init__(placeholder="유저를 선택하세요", min_values=1, max_values=10)
+        self.lobby_view = lobby_view
 
-    async def on_submit(self, interaction: discord.Interaction):
-        name = self.member_name.value.strip().strip("@<>!")
+    async def callback(self, interaction: discord.Interaction):
+        added = []
+        already = []
+        not_registered = []
 
-        # 서버 멤버 중에서 찾기
-        guild = interaction.guild
-        target = None
-        for member in guild.members:
-            if (name.lower() in member.display_name.lower()
-                    or name.lower() in member.name.lower()
-                    or str(member.id) == name):
-                target = member
-                break
+        for user in self.values:
+            if user.bot:
+                continue
+            member = interaction.guild.get_member(user.id)
+            if not member:
+                continue
+            if member.id in self.lobby_view.participants:
+                already.append(member.display_name)
+                continue
 
-        if not target:
-            await interaction.response.send_message("❌ 서버에서 해당 유저를 찾을 수 없습니다.", ephemeral=True)
+            data = await build_participant_data(member)
+            if not data:
+                not_registered.append(member.display_name)
+                continue
+
+            self.lobby_view.participants[member.id] = data
+            added.append(member.display_name)
+
+        msg_parts = []
+        if added:
+            msg_parts.append(f"✅ 추가: {', '.join(added)}")
+        if already:
+            msg_parts.append(f"⏭️ 이미 참가중: {', '.join(already)}")
+        if not_registered:
+            msg_parts.append(f"❌ 미등록: {', '.join(not_registered)}")
+
+        await interaction.response.edit_message(
+            content="\n".join(msg_parts) or "선택된 유저가 없습니다.",
+            view=None,
+        )
+        if added and self.lobby_view.message:
+            await self.lobby_view.message.edit(
+                embed=self.lobby_view.build_embed(), view=self.lobby_view
+            )
+
+
+class ForceJoinSelectView(discord.ui.View):
+    def __init__(self, lobby_view: "LobbyView"):
+        super().__init__(timeout=30)
+        self.add_item(ForceJoinUserSelect(lobby_view))
+
+
+class ForceRemoveButton(discord.ui.Button):
+    """관리자 제거 버튼"""
+
+    def __init__(self):
+        super().__init__(label="제거", style=discord.ButtonStyle.gray, emoji="➖", row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
             return
 
-        if target.id in self.lobby_view.participants:
-            await interaction.response.send_message("이미 참가 중입니다!", ephemeral=True)
+        view: LobbyView = self.view
+        if not view.participants:
+            await interaction.response.send_message("참가자가 없습니다!", ephemeral=True)
             return
 
-        user = await get_user(target.id)
-        if not user:
+        await interaction.response.send_message(
+            "👑 제거할 유저를 선택하세요:",
+            view=ForceRemoveSelectView(view),
+            ephemeral=True,
+        )
+
+
+class ForceRemoveSelect(discord.ui.Select):
+    """참가자 제거 드롭다운"""
+
+    def __init__(self, lobby_view: "LobbyView"):
+        self.lobby_view = lobby_view
+        options = []
+        for uid, info in lobby_view.participants.items():
+            tier_str = f"{info['tier']} {info['rank']}".strip()
+            options.append(discord.SelectOption(
+                label=info["name"],
+                description=f"{info['riot']} - {tier_str}",
+                value=str(uid),
+            ))
+        super().__init__(
+            placeholder="제거할 유저를 선택하세요",
+            min_values=1,
+            max_values=min(len(options), 10),
+            options=options[:25],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        removed = []
+        for uid_str in self.values:
+            uid = int(uid_str)
+            if uid in self.lobby_view.participants:
+                removed.append(self.lobby_view.participants[uid]["name"])
+                del self.lobby_view.participants[uid]
+                # 파티에서도 제거
+                for party in list(self.lobby_view.parties.values()):
+                    party.discard(uid)
+
+        await interaction.response.edit_message(
+            content=f"✅ 제거: {', '.join(removed)}" if removed else "제거된 유저가 없습니다.",
+            view=None,
+        )
+        if removed and self.lobby_view.message:
+            await self.lobby_view.message.edit(
+                embed=self.lobby_view.build_embed(), view=self.lobby_view
+            )
+
+
+class ForceRemoveSelectView(discord.ui.View):
+    def __init__(self, lobby_view: "LobbyView"):
+        super().__init__(timeout=30)
+        self.add_item(ForceRemoveSelect(lobby_view))
+
+
+class VoiceJoinButton(discord.ui.Button):
+    """음성채널 일괄 참가 버튼"""
+
+    def __init__(self):
+        super().__init__(label="음성채널 전체참가", style=discord.ButtonStyle.gray, emoji="🔊", row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        # 명령어 사용자의 음성채널 확인
+        if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.response.send_message(
-                f"❌ **{target.display_name}**은(는) 등록되지 않은 유저입니다. `/대리등록`으로 먼저 등록해주세요.",
-                ephemeral=True,
+                "❌ 먼저 음성채널에 접속해주세요!", ephemeral=True
             )
             return
 
-        elo = await get_effective_elo(target.id)
-        record = await get_user_record(target.id)
+        await interaction.response.defer()
 
-        self.lobby_view.participants[target.id] = {
-            "name": target.display_name,
-            "riot": f"{user['riot_name']}#{user['riot_tag']}",
-            "tier": user["tier"] or "UNRANKED",
-            "rank": user["rank"] or "",
-            "positions": user["preferred_positions"] or "",
-            "lp": user["lp"] if user["lp"] else 0,
-            "elo": elo,
-            "custom_wins": record["win"],
-            "custom_losses": record["lose"],
-        }
+        vc = interaction.user.voice.channel
+        view: LobbyView = self.view
+        added = []
+        skipped = []
+        not_registered = []
 
-        await interaction.response.edit_message(
-            embed=self.lobby_view.build_embed(), view=self.lobby_view
-        )
+        for member in vc.members:
+            if member.bot:
+                continue
+            if member.id in view.participants:
+                skipped.append(member.display_name)
+                continue
+
+            data = await build_participant_data(member)
+            if not data:
+                not_registered.append(member.display_name)
+                continue
+
+            view.participants[member.id] = data
+            added.append(member.display_name)
+
+        # 결과 메시지
+        msg_parts = []
+        if added:
+            msg_parts.append(f"✅ 참가: {', '.join(added)}")
+        if skipped:
+            msg_parts.append(f"⏭️ 이미 참가중: {', '.join(skipped)}")
+        if not_registered:
+            msg_parts.append(f"❌ 미등록: {', '.join(not_registered)}")
+
+        await interaction.followup.send("\n".join(msg_parts) or "음성채널에 아무도 없습니다.", ephemeral=True)
+        await view.message.edit(embed=view.build_embed(), view=view)
 
 
 class GuestJoinButton(discord.ui.Button):
     """게스트 참가 버튼 (디스코드 미가입자)"""
 
     def __init__(self):
-        super().__init__(label="게스트추가", style=discord.ButtonStyle.gray, emoji="👤")
+        super().__init__(label="게스트추가", style=discord.ButtonStyle.gray, emoji="👤", row=1)
 
     async def callback(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
@@ -404,7 +548,7 @@ class StartButton(discord.ui.Button):
     """팀 짜기 시작 버튼"""
 
     def __init__(self):
-        super().__init__(label="팀 짜기!", style=discord.ButtonStyle.green, emoji="⚔️")
+        super().__init__(label="팀 짜기!", style=discord.ButtonStyle.green, emoji="⚔️", row=0)
 
     async def callback(self, interaction: discord.Interaction):
         view: LobbyView = self.view
@@ -545,9 +689,11 @@ class LobbyView(discord.ui.View):
         self.add_item(JoinButton())
         self.add_item(LeaveButton())
         self.add_item(PartyButton())
-        self.add_item(ForceJoinButton())
-        self.add_item(GuestJoinButton())
         self.add_item(StartButton())
+        self.add_item(VoiceJoinButton())
+        self.add_item(ForceJoinButton())
+        self.add_item(ForceRemoveButton())
+        self.add_item(GuestJoinButton())
 
     def build_embed(self) -> discord.Embed:
         embed = discord.Embed(
@@ -755,6 +901,49 @@ class CustomGame(commands.Cog):
         embed = view.build_embed()
         await interaction.response.send_message(embed=embed, view=view)
         view.message = await interaction.original_response()
+
+    @app_commands.command(name="빠른내전", description="음성채널에 있는 사람들로 바로 팀을 짜줍니다")
+    async def quick_match(self, interaction: discord.Interaction):
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("❌ 먼저 음성채널에 접속해주세요!", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        vc = interaction.user.voice.channel
+        view = LobbyView()
+        not_registered = []
+
+        for member in vc.members:
+            if member.bot:
+                continue
+            data = await build_participant_data(member)
+            if not data:
+                not_registered.append(member.display_name)
+                continue
+            view.participants[member.id] = data
+
+        if len(view.participants) < 2:
+            msg = "❌ 등록된 유저가 2명 미만입니다."
+            if not_registered:
+                msg += f"\n미등록: {', '.join(not_registered)}"
+            await interaction.followup.send(msg)
+            return
+
+        blue, red = balance_teams(view.participants, view.parties)
+        view.last_blue = blue
+        view.last_red = red
+
+        embed = build_team_embed(view.participants, blue, red, "⚡ 빠른내전 팀 구성 완료!")
+        if not_registered:
+            embed.add_field(
+                name="⚠️ 미등록 유저 (제외됨)",
+                value=", ".join(not_registered),
+                inline=False,
+            )
+
+        msg = await interaction.followup.send(embed=embed, view=ResultView(view))
+        view.message = msg
 
     @app_commands.command(name="코인토스", description="블루/레드 사이드를 랜덤으로 결정합니다")
     async def coin_toss(self, interaction: discord.Interaction):

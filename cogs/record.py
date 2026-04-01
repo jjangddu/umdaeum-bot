@@ -2,7 +2,21 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.database import create_match, set_match_winner, get_user_record, get_recent_matches, get_user
+from utils.database import (
+    create_match, set_match_winner, get_user_record,
+    get_recent_matches, get_user, get_effective_elo,
+)
+
+
+async def _resolve_name(bot: commands.Bot, guild: discord.Guild, discord_id: int) -> str:
+    """discord_id로 표시 이름 가져오기 (서버 닉네임 > riot 이름 > ID)"""
+    member = guild.get_member(discord_id)
+    if member:
+        return member.display_name
+    user = await get_user(discord_id)
+    if user:
+        return f"{user['riot_name']}"
+    return str(discord_id)
 
 
 class Record(commands.Cog):
@@ -51,22 +65,67 @@ class Record(commands.Cog):
         losses = record["lose"]
         total = wins + losses
         winrate = wins * 100 // max(total, 1)
+        elo = await get_effective_elo(target.id)
 
         embed = discord.Embed(
             title=f"⚔️ {target.display_name}의 내전 전적",
             color=discord.Color.purple(),
         )
-        embed.add_field(name="전적", value=f"**{wins}승 {losses}패** (총 {total}판)", inline=False)
+        embed.add_field(name="전적", value=f"**{wins}승 {losses}패** (총 {total}판)", inline=True)
         embed.add_field(name="승률", value=f"**{winrate}%**", inline=True)
+        embed.add_field(name="내전 ELO", value=f"**{elo}**", inline=True)
+
+        # 최근 5경기 기록
+        from utils.database import get_db
+        import aiosqlite
+        db = await get_db()
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT mr.match_id, mr.team, mr.result, m.played_at, m.blue_team, m.red_team
+               FROM match_records mr
+               JOIN matches m ON mr.match_id = m.match_id
+               WHERE mr.discord_id=? AND mr.result IS NOT NULL
+               ORDER BY mr.match_id DESC LIMIT 5""",
+            (target.id,),
+        )
+        recent = await cursor.fetchall()
+        await db.close()
+
+        if recent:
+            history_lines = []
+            for r in recent:
+                emoji = "✅" if r["result"] == "win" else "❌"
+                team_emoji = "🔵" if r["team"] == "blue" else "🔴"
+                date = r["played_at"][:10] if r["played_at"] else ""
+
+                # 같은 팀 멤버 이름
+                if r["team"] == "blue":
+                    team_ids = [int(x) for x in r["blue_team"].split(",")]
+                else:
+                    team_ids = [int(x) for x in r["red_team"].split(",")]
+                teammates = []
+                for tid in team_ids:
+                    if tid != target.id:
+                        name = await _resolve_name(self.bot, interaction.guild, tid)
+                        teammates.append(name)
+                team_str = ", ".join(teammates[:4]) if teammates else ""
+
+                history_lines.append(
+                    f"{emoji} 매치#{r['match_id']} {team_emoji} {'승' if r['result'] == 'win' else '패'}"
+                    f" | {team_str} | {date}"
+                )
+            embed.add_field(name="최근 경기", value="\n".join(history_lines), inline=False)
 
         await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="최근내전", description="최근 내전 기록을 확인합니다")
     async def recent_matches(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
         matches = await get_recent_matches(10)
 
         if not matches:
-            await interaction.response.send_message("📋 아직 기록된 내전이 없습니다.")
+            await interaction.followup.send("📋 아직 기록된 내전이 없습니다.")
             return
 
         embed = discord.Embed(title="📋 최근 내전 기록", color=discord.Color.teal())
@@ -75,57 +134,42 @@ class Record(commands.Cog):
             winner = match["winner"]
             if winner:
                 emoji = "🔵" if winner == "blue" else "🔴"
-                result = f"{emoji} {'블루팀' if winner == 'blue' else '레드팀'} 승리"
+                result_str = f"{emoji} {'블루팀' if winner == 'blue' else '레드팀'} 승리"
             else:
-                result = "⏳ 결과 미등록"
+                result_str = "⏳ 결과 미등록"
+
+            # 팀 멤버 이름 표시
+            blue_ids = [int(x) for x in match["blue_team"].split(",") if x]
+            red_ids = [int(x) for x in match["red_team"].split(",") if x]
+
+            blue_names = []
+            for uid in blue_ids:
+                name = await _resolve_name(self.bot, interaction.guild, uid)
+                mark = " ✅" if winner == "blue" else " ❌" if winner == "red" else ""
+                blue_names.append(f"{name}{mark}")
+
+            red_names = []
+            for uid in red_ids:
+                name = await _resolve_name(self.bot, interaction.guild, uid)
+                mark = " ✅" if winner == "red" else " ❌" if winner == "blue" else ""
+                red_names.append(f"{name}{mark}")
+
+            date = match["played_at"][:16] if match["played_at"] else ""
+
+            value = (
+                f"{result_str}\n"
+                f"🔵 {', '.join(blue_names)}\n"
+                f"🔴 {', '.join(red_names)}\n"
+                f"📅 {date}"
+            )
 
             embed.add_field(
                 name=f"매치 #{match['match_id']}",
-                value=f"{result}\n📅 {match['played_at'][:16]}",
-                inline=True,
+                value=value,
+                inline=False,
             )
 
-        await interaction.response.send_message(embed=embed)
-
-
-class SaveMatchView(discord.ui.View):
-    """내전 결과 저장 뷰 - CustomGame에서 호출"""
-
-    def __init__(self, blue_ids: list[int], red_ids: list[int]):
-        super().__init__(timeout=3600)
-        self.blue_ids = blue_ids
-        self.red_ids = red_ids
-        self.match_id: int | None = None
-
-    @discord.ui.button(label="기록 저장", style=discord.ButtonStyle.green, emoji="💾")
-    async def save_match(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.match_id:
-            await interaction.response.send_message(f"이미 저장되었습니다! (매치 #{self.match_id})", ephemeral=True)
-            return
-
-        self.match_id = await create_match(self.blue_ids, self.red_ids, interaction.user.id)
-        await interaction.response.send_message(
-            f"💾 매치 **#{self.match_id}**로 저장되었습니다!\n"
-            f"결과 등록: `/결과등록 {self.match_id} 블루팀/레드팀`"
-        )
-
-    @discord.ui.button(label="🔵 블루팀 승리", style=discord.ButtonStyle.blurple)
-    async def blue_wins(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.match_id:
-            self.match_id = await create_match(self.blue_ids, self.red_ids, interaction.user.id)
-
-        await set_match_winner(self.match_id, "blue")
-        await interaction.response.send_message(f"✅ 매치 #{self.match_id}: 🔵 **블루팀** 승리 기록 완료!")
-        self.stop()
-
-    @discord.ui.button(label="🔴 레드팀 승리", style=discord.ButtonStyle.red)
-    async def red_wins(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.match_id:
-            self.match_id = await create_match(self.blue_ids, self.red_ids, interaction.user.id)
-
-        await set_match_winner(self.match_id, "red")
-        await interaction.response.send_message(f"✅ 매치 #{self.match_id}: 🔴 **레드팀** 승리 기록 완료!")
-        self.stop()
+        await interaction.followup.send(embed=embed)
 
 
 async def setup(bot: commands.Bot):

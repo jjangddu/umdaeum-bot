@@ -5,6 +5,7 @@ from discord.ext import commands
 from utils.database import (
     register_user, get_user, set_positions, update_user_stats,
     find_user_by_riot_id, get_effective_elo, set_elo_override,
+    set_estimated_tier,
 )
 from utils.riot_api import fetch_full_profile, TIER_EMOJI
 
@@ -206,6 +207,92 @@ class Register(commands.Cog):
         display = ", ".join(pos_names[p] for p in positions)
 
         await interaction.response.send_message(f"✅ 선호 포지션이 **{display}**(으)로 설정되었습니다!")
+
+    # ── 예상 티어 설정 ──
+
+    TIER_CHOICES = [
+        app_commands.Choice(name="아이언", value="IRON"),
+        app_commands.Choice(name="브론즈", value="BRONZE"),
+        app_commands.Choice(name="실버", value="SILVER"),
+        app_commands.Choice(name="골드", value="GOLD"),
+        app_commands.Choice(name="플래티넘", value="PLATINUM"),
+        app_commands.Choice(name="에메랄드", value="EMERALD"),
+        app_commands.Choice(name="다이아몬드", value="DIAMOND"),
+        app_commands.Choice(name="마스터+", value="MASTER"),
+    ]
+
+    RANK_CHOICES = [
+        app_commands.Choice(name="IV", value="IV"),
+        app_commands.Choice(name="III", value="III"),
+        app_commands.Choice(name="II", value="II"),
+        app_commands.Choice(name="I", value="I"),
+    ]
+
+    @app_commands.command(name="예상티어", description="언랭/예상 티어를 설정합니다")
+    @app_commands.describe(
+        tier="티어",
+        rank="단계 (마스터 이상은 선택 안해도 됨)",
+    )
+    @app_commands.choices(tier=TIER_CHOICES, rank=RANK_CHOICES)
+    async def estimated_tier(
+        self,
+        interaction: discord.Interaction,
+        tier: app_commands.Choice[str],
+        rank: app_commands.Choice[str] = None,
+    ):
+        user = await get_user(interaction.user.id)
+        if not user:
+            await interaction.response.send_message("❌ 먼저 `/등록`으로 닉네임을 등록해주세요.")
+            return
+
+        rank_val = rank.value if rank else ""
+        if tier.value in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+            rank_val = ""
+
+        await set_estimated_tier(interaction.user.id, tier.value, rank_val)
+
+        emoji = TIER_EMOJI.get(tier.value, "")
+        display = f"{tier.name} {rank.name}" if rank and rank_val else tier.name
+
+        await interaction.response.send_message(f"✅ 예상 티어가 {emoji} **{display}**(으)로 설정되었습니다!")
+
+    @app_commands.command(name="예상티어설정", description="[관리자] 다른 유저의 예상 티어를 설정합니다")
+    @app_commands.describe(
+        member="설정할 유저",
+        tier="티어",
+        rank="단계 (마스터 이상은 선택 안해도 됨)",
+    )
+    @app_commands.choices(tier=TIER_CHOICES, rank=RANK_CHOICES)
+    @app_commands.checks.has_permissions(administrator=True)
+    async def admin_estimated_tier(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        tier: app_commands.Choice[str],
+        rank: app_commands.Choice[str] = None,
+    ):
+        user = await get_user(member.id)
+        if not user:
+            await interaction.response.send_message("❌ 등록되지 않은 사용자입니다.", ephemeral=True)
+            return
+
+        rank_val = rank.value if rank else ""
+        if tier.value in ("MASTER", "GRANDMASTER", "CHALLENGER"):
+            rank_val = ""
+
+        await set_estimated_tier(member.id, tier.value, rank_val)
+
+        emoji = TIER_EMOJI.get(tier.value, "")
+        display = f"{tier.name} {rank.name}" if rank and rank_val else tier.name
+
+        await interaction.response.send_message(
+            f"✅ **{member.display_name}**의 예상 티어가 {emoji} **{display}**(으)로 설정되었습니다!"
+        )
+
+    @admin_estimated_tier.error
+    async def admin_estimated_tier_error(self, interaction: discord.Interaction, error):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message("❌ 관리자 권한이 필요합니다.", ephemeral=True)
 
     # ── 관리자 ELO 보정 ──
 

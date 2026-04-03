@@ -101,6 +101,16 @@ async def update_user_stats(discord_id: int, tier: str, rank: str, wins: int, lo
         await db.commit()
 
 
+async def set_estimated_tier(discord_id: int, tier: str, rank: str):
+    """언랭 유저의 예상 티어 설정"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET tier=?, rank=? WHERE discord_id=?",
+            (tier, rank, discord_id),
+        )
+        await db.commit()
+
+
 async def get_user(discord_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
